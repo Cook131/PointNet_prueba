@@ -1,88 +1,302 @@
-import tensorflow as tf
-import numpy as np
-from pointnet_utils import pointnet_sa_module, pointnet_fp_module
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-class PointNetPose:
-    def __init__(self, num_points=1024, num_pose_params=6):
-        """
-        PointNet adaptado para estimación de pose
-        
-        Args:
-            num_points: Número de puntos en la nube
-            num_pose_params: 6 para 6DOF (3 rotación + 3 translación)
-                           4 para quaternion + 3 translación = 7
-        """
+from models.transform_net import STN3d, STNkd
+
+class PointNetPose(nn.Module):
+    """
+    PointNet adaptado para estimación de pose del oil pan
+    Predice 6 DOF: 3 rotaciones (euler angles) + 3 traslaciones
+    """
+    
+    def __init__(self, num_points=1024, pose_dim=6, dropout=0.3, feature_transform=True):
+        super(PointNetPose, self).__init__()
         self.num_points = num_points
-        self.num_pose_params = num_pose_params
+        self.pose_dim = pose_dim
+        self.feature_transform = feature_transform
         
-    def get_model(self, point_cloud, is_training, bn_decay=None):
-        """Red PointNet para estimación de pose"""
-        batch_size = tf.shape(point_cloud)[0]
+        # Spatial transformer networks
+        self.stn3d = STN3d()
+        if self.feature_transform:
+            self.stnkd = STNkd(k=64)
         
-        # Input Transform Net - T-Net para alineación inicial
-        with tf.variable_scope('transform_net1'):
-            transform = self.input_transform_net(point_cloud, is_training, bn_decay, K=3)
+        # Shared MLPs
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
         
-        point_cloud_transformed = tf.matmul(point_cloud, transform)
+        # Batch normalization
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
         
-        # Capas convolucionales para extracción de características
-        net = tf.expand_dims(point_cloud_transformed, -1)
+        # Pose estimation head
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, pose_dim)
         
-        # Primera serie de capas conv
-        net = self.conv2d(net, 64, [1,3], padding='VALID', stride=[1,1],
-                         bn=True, is_training=is_training, scope='conv1', bn_decay=bn_decay)
-        net = self.conv2d(net, 64, [1,1], padding='VALID', stride=[1,1],
-                         bn=True, is_training=is_training, scope='conv2', bn_decay=bn_decay)
+        # Batch normalization for FC layers
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
         
-        # Feature Transform Net - T-Net para características de 64D
-        with tf.variable_scope('transform_net2'):
-            transform = self.feature_transform_net(net, is_training, bn_decay, K=64)
+        # Dropout
+        self.dropout = nn.Dropout(p=dropout)
         
-        net = tf.squeeze(net, axis=[2])
-        net_transformed = tf.matmul(net, transform)
-        net_transformed = tf.expand_dims(net_transformed, [2])
+    def forward(self, x):
+        """
+        Forward pass
+        Args:
+            x: input point cloud [B, 3, N]
+        Returns:
+            pose: predicted pose [B, 6] (rx, ry, rz, tx, ty, tz)
+            feature_transform: transformation matrix for regularization
+        """
+        batch_size = x.size(0)
+        num_points = x.size(2)
         
-        # Más capas convolucionales
-        net = self.conv2d(net_transformed, 64, [1,1], padding='VALID', stride=[1,1],
-                         bn=True, is_training=is_training, scope='conv3', bn_decay=bn_decay)
-        net = self.conv2d(net, 128, [1,1], padding='VALID', stride=[1,1],
-                         bn=True, is_training=is_training, scope='conv4', bn_decay=bn_decay)
-        net = self.conv2d(net, 1024, [1,1], padding='VALID', stride=[1,1],
-                         bn=True, is_training=is_training, scope='conv5', bn_decay=bn_decay)
+        # Input transform
+        input_transform = self.stn3d(x)  # [B, 3, 3]
+        x = x.transpose(2, 1)  # [B, N, 3]
+        x = torch.bmm(x, input_transform)  # Apply transformation
+        x = x.transpose(2, 1)  # [B, 3, N]
         
-        # Global feature (Max pooling)
-        global_feat = tf.reduce_max(net, axis=1, keepdims=True)
+        # First layer
+        x = F.relu(self.bn1(self.conv1(x)))  # [B, 64, N]
         
-        # Fully connected layers para regresión de pose
-        net = tf.reshape(global_feat, [batch_size, -1])
-        net = self.fc_layer(net, 512, True, is_training, bn_decay, 'fc1')
-        net = self.dropout(net, keep_prob=0.7, is_training=is_training, scope='dp1')
-        net = self.fc_layer(net, 256, True, is_training, bn_decay, 'fc2')
-        net = self.dropout(net, keep_prob=0.7, is_training=is_training, scope='dp2')
+        # Feature transform
+        if self.feature_transform:
+            feature_transform = self.stnkd(x)  # [B, 64, 64]
+            x = x.transpose(2, 1)  # [B, N, 64]
+            x = torch.bmm(x, feature_transform)  # Apply transformation
+            x = x.transpose(2, 1)  # [B, 64, N]
+        else:
+            feature_transform = None
         
-        # Salida final - parámetros de pose
-        pose_params = self.fc_layer(net, self.num_pose_params, False, is_training, bn_decay, 'fc3')
+        # Shared MLPs
+        point_features = F.relu(self.bn2(self.conv2(x)))  # [B, 128, N]
+        x = self.bn3(self.conv3(point_features))  # [B, 1024, N]
         
-        return pose_params, transform
+        # Global feature
+        global_feature = torch.max(x, 2, keepdim=True)[0]  # [B, 1024, 1]
+        global_feature = global_feature.view(-1, 1024)  # [B, 1024]
+        
+        # Pose estimation
+        x = F.relu(self.bn4(self.fc1(global_feature)))  # [B, 512]
+        x = self.dropout(x)
+        x = F.relu(self.bn5(self.fc2(x)))  # [B, 256]
+        x = self.dropout(x)
+        pose = self.fc3(x)  # [B, 6]
+        
+        return pose, feature_transform
+
+class PointNetPoseClassification(nn.Module):
+    """
+    Variante que trata la estimación de pose como clasificación discreta
+    Útil para poses limitadas a un conjunto específico
+    """
     
-    def input_transform_net(self, point_cloud, is_training, bn_decay=None, K=3):
-        """T-Net para transformación de entrada"""
-        # Implementar T-Net estándar aquí
-        # ... (código del T-Net original de PointNet)
-        pass
+    def __init__(self, num_points=1024, num_pose_classes=24, dropout=0.3, feature_transform=True):
+        super(PointNetPoseClassification, self).__init__()
+        self.num_points = num_points
+        self.num_pose_classes = num_pose_classes
+        self.feature_transform = feature_transform
+        
+        # Usar la misma estructura base
+        self.stn3d = STN3d()
+        if self.feature_transform:
+            self.stnkd = STNkd(k=64)
+        
+        # Shared MLPs
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        
+        # Batch normalization
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        
+        # Classification head
+        self.fc1 = nn.Linear(1024, 512)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, num_pose_classes)
+        
+        # Batch normalization for FC layers
+        self.bn4 = nn.BatchNorm1d(512)
+        self.bn5 = nn.BatchNorm1d(256)
+        
+        # Dropout
+        self.dropout = nn.Dropout(p=dropout)
+        
+    def forward(self, x):
+        """
+        Forward pass for classification
+        Args:
+            x: input point cloud [B, 3, N]
+        Returns:
+            logits: class logits [B, num_pose_classes]
+            feature_transform: transformation matrix for regularization
+        """
+        batch_size = x.size(0)
+        
+        # Input transform
+        input_transform = self.stn3d(x)
+        x = x.transpose(2, 1)
+        x = torch.bmm(x, input_transform)
+        x = x.transpose(2, 1)
+        
+        # First layer
+        x = F.relu(self.bn1(self.conv1(x)))
+        
+        # Feature transform
+        if self.feature_transform:
+            feature_transform = self.stnkd(x)
+            x = x.transpose(2, 1)
+            x = torch.bmm(x, feature_transform)
+            x = x.transpose(2, 1)
+        else:
+            feature_transform = None
+        
+        # Shared MLPs
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))
+        
+        # Global feature
+        global_feature = torch.max(x, 2, keepdim=True)[0]
+        global_feature = global_feature.view(-1, 1024)
+        
+        # Classification
+        x = F.relu(self.bn4(self.fc1(global_feature)))
+        x = self.dropout(x)
+        x = F.relu(self.bn5(self.fc2(x)))
+        x = self.dropout(x)
+        logits = self.fc3(x)
+        
+        return logits, feature_transform
+
+class PointNetPoseHybrid(nn.Module):
+    """
+    Modelo híbrido que predice tanto pose continua como clasificación discreta
+    Útil para combinar precisión continua con robustez de clasificación
+    """
     
-    def feature_transform_net(self, inputs, is_training, bn_decay=None, K=64):
-        """T-Net para transformación de características"""
-        # Implementar T-Net para características
-        # ... (código del T-Net de características)
-        pass
+    def __init__(self, num_points=1024, pose_dim=6, num_pose_classes=24, dropout=0.3):
+        super(PointNetPoseHybrid, self).__init__()
+        self.num_points = num_points
+        self.pose_dim = pose_dim
+        self.num_pose_classes = num_pose_classes
+        
+        # Feature extractor compartido
+        self.stn3d = STN3d()
+        self.stnkd = STNkd(k=64)
+        
+        # Shared MLPs
+        self.conv1 = nn.Conv1d(3, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, 1024, 1)
+        
+        # Batch normalization
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+        
+        # Capas compartidas
+        self.fc_shared = nn.Linear(1024, 512)
+        self.bn_shared = nn.BatchNorm1d(512)
+        
+        # Head de regresión (pose continua)
+        self.fc_reg1 = nn.Linear(512, 256)
+        self.fc_reg2 = nn.Linear(256, pose_dim)
+        self.bn_reg = nn.BatchNorm1d(256)
+        
+        # Head de clasificación (pose discreta)
+        self.fc_cls1 = nn.Linear(512, 256)
+        self.fc_cls2 = nn.Linear(256, num_pose_classes)
+        self.bn_cls = nn.BatchNorm1d(256)
+        
+        # Dropout
+        self.dropout = nn.Dropout(p=dropout)
+        
+    def forward(self, x):
+        """
+        Forward pass híbrido
+        Returns:
+            pose_regression: pose continua [B, 6]
+            pose_classification: logits de clasificación [B, num_classes]
+            feature_transform: para regularización
+        """
+        batch_size = x.size(0)
+        
+        # Feature extraction (igual que PointNet estándar)
+        input_transform = self.stn3d(x)
+        x = x.transpose(2, 1)
+        x = torch.bmm(x, input_transform)
+        x = x.transpose(2, 1)
+        
+        x = F.relu(self.bn1(self.conv1(x)))
+        
+        feature_transform = self.stnkd(x)
+        x = x.transpose(2, 1)
+        x = torch.bmm(x, feature_transform)
+        x = x.transpose(2, 1)
+        
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))
+        
+        # Global feature
+        global_feature = torch.max(x, 2, keepdim=True)[0]
+        global_feature = global_feature.view(-1, 1024)
+        
+        # Capa compartida
+        shared_features = F.relu(self.bn_shared(self.fc_shared(global_feature)))
+        shared_features = self.dropout(shared_features)
+        
+        # Head de regresión
+        reg_features = F.relu(self.bn_reg(self.fc_reg1(shared_features)))
+        reg_features = self.dropout(reg_features)
+        pose_regression = self.fc_reg2(reg_features)
+        
+        # Head de clasificación
+        cls_features = F.relu(self.bn_cls(self.fc_cls1(shared_features)))
+        cls_features = self.dropout(cls_features)
+        pose_classification = self.fc_cls2(cls_features)
+        
+        return pose_regression, pose_classification, feature_transform
+
+# Función de utilidad para crear el modelo según configuración
+def create_pose_model(config, model_type='regression'):
+    """
+    Crear modelo según configuración
     
-    def conv2d(self, inputs, num_outputs, kernel_size, **kwargs):
-        """Capa convolucional 2D"""
-        # Implementar usando tf.layers.conv2d
-        pass
+    Args:
+        config: configuración del sistema
+        model_type: 'regression', 'classification', o 'hybrid'
+    """
+    model_config = config['model']
     
-    def fc_layer(self, inputs, num_outputs, bn, is_training, bn_decay, scope):
-        """Capa completamente conectada"""
-        # Implementar usando tf.layers.dense
-        pass
+    if model_type == 'regression':
+        model = PointNetPose(
+            num_points=model_config.num_points,
+            pose_dim=model_config.pose_dim,
+            dropout=model_config.dropout,
+            feature_transform=True
+        )
+    elif model_type == 'classification':
+        model = PointNetPoseClassification(
+            num_points=model_config.num_points,
+            num_pose_classes=model_config.num_pose_classes,
+            dropout=model_config.dropout,
+            feature_transform=True
+        )
+    elif model_type == 'hybrid':
+        model = PointNetPoseHybrid(
+            num_points=model_config.num_points,
+            pose_dim=model_config.pose_dim,
+            num_pose_classes=model_config.num_pose_classes,
+            dropout=model_config.dropout
+        )
+    else:
+        raise ValueError(f"Tipo de modelo no soportado: {model_type}")
+    
+    return model

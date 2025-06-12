@@ -1,109 +1,357 @@
-import tensorflow as tf
+#!/usr/bin/env python3
+"""
+Script principal para entrenar el modelo PointNet para estimación de pose del oil pan
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 import numpy as np
-import h5py
+import sys
+import os
+import time
+import json
+from tqdm import tqdm
+import argparse
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Imports locales
 from models.pointnet_pose import PointNetPose
-from pose_loss import pose_loss, regularization_loss
+from training.config import get_config
+from utils.data_prep_pose import create_data_loaders, validate_dataset
+from models.pointnet_utils import feature_transform_regularizer
+from utils.visualization import PointCloudVisualizer
+from training.evaluate_pose import PoseEvaluator
 
-def train_pose_estimation():
-    # Configuración
-    BATCH_SIZE = 32
-    MAX_EPOCH = 250
-    LEARNING_RATE = 0.001
-    NUM_POINTS = 1024
-    DECAY_STEP = 200000
-    DECAY_RATE = 0.7
+class PoseTrainer:
+    """Clase principal para entrenar el modelo de estimación de pose"""
     
-    # Cargar datos
-    train_data, train_poses = load_pose_data('train')
-    test_data, test_poses = load_pose_data('test')
-    
-    # Placeholders
-    pointclouds_pl = tf.placeholder(tf.float32, shape=(BATCH_SIZE, NUM_POINTS, 3))
-    poses_pl = tf.placeholder(tf.float32, shape=(BATCH_SIZE, 6))
-    is_training_pl = tf.placeholder(tf.bool, shape=())
-    
-    # Modelo
-    model = PointNetPose(num_points=NUM_POINTS, num_pose_params=6)
-    pred_poses, transform = model.get_model(pointclouds_pl, is_training_pl)
-    
-    # Pérdidas
-    pose_loss_val, trans_loss, rot_loss = pose_loss(pred_poses, poses_pl)
-    reg_loss = regularization_loss(transform)
-    total_loss = pose_loss_val + reg_loss
-    
-    # Optimizador
-    learning_rate = tf.train.exponential_decay(
-        LEARNING_RATE, tf.train.get_global_step(),
-        DECAY_STEP, DECAY_RATE, staircase=True)
-    
-    optimizer = tf.train.AdamOptimizer(learning_rate)
-    train_op = optimizer.minimize(total_loss, global_step=tf.train.get_global_step())
-    
-    # Métricas
-    pose_error = tf.reduce_mean(tf.abs(pred_poses - poses_pl))
-    
-    # Sesión de entrenamiento
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
+    def __init__(self, config, device='cuda'):
+        self.config = config
+        self.device = device
         
-        for epoch in range(MAX_EPOCH):
-            # Entrenamiento
-            for batch in get_batches(train_data, train_poses, BATCH_SIZE):
-                feed_dict = {
-                    pointclouds_pl: batch[0],
-                    poses_pl: batch[1],
-                    is_training_pl: True
-                }
-                
-                _, loss_val, trans_l, rot_l = sess.run(
-                    [train_op, total_loss, trans_loss, rot_loss], 
-                    feed_dict=feed_dict)
+        # Crear directorios necesarios
+        os.makedirs(config['system'].model_save_dir, exist_ok=True)
+        os.makedirs(config['system'].log_dir, exist_ok=True)
+        os.makedirs(config['system'].checkpoints_dir, exist_ok=True)
+        
+        # Inicializar modelo
+        self.model = PointNetPose(
+            num_points=config['model'].num_points,
+            pose_dim=config['model'].pose_dim,
+            dropout=config['model'].dropout
+        ).to(device)
+        
+        # Inicializar optimizador
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config['training'].learning_rate,
+            weight_decay=config['training'].weight_decay
+        )
+        
+        # Scheduler
+        self.scheduler = StepLR(
+            self.optimizer,
+            step_size=config['training'].step_size,
+            gamma=config['training'].gamma
+        )
+        
+        # Criterio de pérdida
+        self.criterion = nn.MSELoss()
+        
+        # Métricas de entrenamiento
+        self.train_losses = []
+        self.val_losses = []
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        
+        # Inicializar visualizador y evaluador
+        self.visualizer = PointCloudVisualizer()
+        self.evaluator = PoseEvaluator(device)
+        
+    def train_epoch(self, train_loader):
+        """Entrenar una época"""
+        self.model.train()
+        total_loss = 0.0
+        total_samples = 0
+        
+        progress_bar = tqdm(train_loader, desc="Training")
+        
+        for batch_idx, (points, poses) in enumerate(progress_bar):
+            points = points.to(self.device)  # [B, 3, N]
+            poses = poses.to(self.device)    # [B, 6]
             
-            # Evaluación
-            if epoch % 10 == 0:
-                test_loss, test_error = evaluate_model(
-                    sess, pointclouds_pl, poses_pl, is_training_pl,
-                    total_loss, pose_error, test_data, test_poses)
+            # Forward pass
+            self.optimizer.zero_grad()
+            outputs, feature_transform = self.model(points)
+            
+            # Calcular pérdida principal
+            pose_loss = self.criterion(outputs, poses)
+            
+            # Pérdida de regularización para la transformación de características
+            reg_loss = feature_transform_regularizer(feature_transform)
+            
+            # Pérdida total
+            total_loss_batch = pose_loss + self.config['training'].feature_transform_reg_weight * reg_loss
+            
+            # Backward pass
+            total_loss_batch.backward()
+            self.optimizer.step()
+            
+            # Acumular estadísticas
+            total_loss += total_loss_batch.item() * points.size(0)
+            total_samples += points.size(0)
+            
+            # Actualizar progress bar
+            progress_bar.set_postfix({
+                'Loss': f"{total_loss_batch.item():.4f}",
+                'Pose Loss': f"{pose_loss.item():.4f}",
+                'Reg Loss': f"{reg_loss.item():.4f}"
+            })
+            
+            # Log cada cierto número de batches
+            if batch_idx % self.config['system'].log_interval == 0:
+                self.log_training_step(batch_idx, len(train_loader), total_loss_batch.item())
+        
+        return total_loss / total_samples
+    
+    def validate_epoch(self, val_loader):
+        """Validar una época"""
+        self.model.eval()
+        total_loss = 0.0
+        total_samples = 0
+        
+        all_predictions = []
+        all_ground_truth = []
+        
+        with torch.no_grad():
+            for points, poses in tqdm(val_loader, desc="Validation"):
+                points = points.to(self.device)
+                poses = poses.to(self.device)
                 
-                print(f'Epoch {epoch}: Train Loss: {loss_val:.4f}, '
-                      f'Test Loss: {test_loss:.4f}, Test Error: {test_error:.4f}')
-
-def load_pose_data(split):
-    """Cargar datos de pose desde HDF5"""
-    with h5py.File(f'./data/processed/pose_{split}.h5', 'r') as f:
-        data = f['data'][:]
-        poses = f['poses'][:]
-    return data, poses
-
-def get_batches(data, poses, batch_size):
-    """Generador para lotes de datos y poses"""
-    num_samples = data.shape[0]
-    indices = np.arange(num_samples)
-    np.random.shuffle(indices)
-    for start_idx in range(0, num_samples, batch_size):
-        end_idx = min(start_idx + batch_size, num_samples)
-        excerpt = indices[start_idx:end_idx]
-        yield data[excerpt], poses[excerpt]
-
-def evaluate_model(sess, pointclouds_pl, poses_pl, is_training_pl,
-                   total_loss, pose_error, test_data, test_poses, batch_size=32):
-    """Evalúa el modelo en los datos de prueba"""
-    num_samples = test_data.shape[0]
-    total_loss_val = 0
-    total_error_val = 0
-    num_batches = 0
-    for start_idx in range(0, num_samples, batch_size):
-        end_idx = min(start_idx + batch_size, num_samples)
-        feed_dict = {
-            pointclouds_pl: test_data[start_idx:end_idx],
-            poses_pl: test_poses[start_idx:end_idx],
-            is_training_pl: False
+                # Forward pass
+                outputs, feature_transform = self.model(points)
+                
+                # Calcular pérdida
+                pose_loss = self.criterion(outputs, poses)
+                reg_loss = feature_transform_regularizer(feature_transform)
+                total_loss_batch = pose_loss + self.config['training'].feature_transform_reg_weight * reg_loss
+                
+                # Acumular estadísticas
+                total_loss += total_loss_batch.item() * points.size(0)
+                total_samples += points.size(0)
+                
+                # Guardar predicciones para evaluación
+                all_predictions.append(outputs.cpu())
+                all_ground_truth.append(poses.cpu())
+        
+        # Calcular métricas de pose
+        all_predictions = torch.cat(all_predictions, dim=0)
+        all_ground_truth = torch.cat(all_ground_truth, dim=0)
+        
+        pose_metrics = self.evaluator.evaluate_pose_accuracy(all_predictions, all_ground_truth)
+        
+        return total_loss / total_samples, pose_metrics
+    
+    def train(self, train_loader, val_loader, num_epochs=None):
+        """Bucle principal de entrenamiento"""
+        if num_epochs is None:
+            num_epochs = self.config['training'].num_epochs
+            
+        print(f"Iniciando entrenamiento por {num_epochs} épocas...")
+        print(f"Modelo: {self.model.__class__.__name__}")
+        print(f"Device: {self.device}")
+        print(f"Parámetros del modelo: {sum(p.numel() for p in self.model.parameters())}")
+        
+        start_time = time.time()
+        
+        for epoch in range(num_epochs):
+            epoch_start_time = time.time()
+            
+            # Entrenar
+            train_loss = self.train_epoch(train_loader)
+            
+            # Validar
+            val_loss, pose_metrics = self.validate_epoch(val_loader)
+            
+            # Actualizar scheduler
+            self.scheduler.step()
+            
+            # Guardar métricas
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            
+            epoch_time = time.time() - epoch_start_time
+            
+            # Imprimir progreso
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            print(f"Train Loss: {train_loss:.6f}")
+            print(f"Val Loss: {val_loss:.6f}")
+            print(f"Rotation Accuracy: {pose_metrics['rotation_accuracy']:.4f}")
+            print(f"Translation Accuracy: {pose_metrics['translation_accuracy']:.4f}")
+            print(f"Combined Accuracy: {pose_metrics['combined_accuracy']:.4f}")
+            print(f"Mean Rotation Error: {pose_metrics['mean_rotation_error_deg']:.2f}°")
+            print(f"Epoch Time: {epoch_time:.2f}s")
+            print("-" * 50)
+            
+            # Guardar mejor modelo
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.patience_counter = 0
+                self.save_checkpoint(epoch, val_loss, pose_metrics, is_best=True)
+                print(f"✓ Nuevo mejor modelo guardado (val_loss: {val_loss:.6f})")
+            else:
+                self.patience_counter += 1
+            
+            # Guardar checkpoint periódico
+            if (epoch + 1) % self.config['system'].save_interval == 0:
+                self.save_checkpoint(epoch, val_loss, pose_metrics, is_best=False)
+            
+            # Early stopping
+            if self.patience_counter >= self.config['training'].patience:
+                print(f"Early stopping activado después de {epoch+1} épocas")
+                break
+            
+            # Visualización periódica
+            if (epoch + 1) % self.config['system'].vis_interval == 0:
+                self.visualize_training_progress(epoch)
+        
+        total_time = time.time() - start_time
+        print(f"\nEntrenamiento completado en {total_time/3600:.2f} horas")
+        
+        # Guardar métricas finales
+        self.save_training_metrics()
+        
+    def save_checkpoint(self, epoch, val_loss, pose_metrics, is_best=False):
+        """Guardar checkpoint del modelo"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'val_loss': val_loss,
+            'pose_metrics': pose_metrics,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'config': self.config
         }
-        loss_val, error_val = sess.run([total_loss, pose_error], feed_dict=feed_dict)
-        total_loss_val += loss_val * (end_idx - start_idx)
-        total_error_val += error_val * (end_idx - start_idx)
-        num_batches += (end_idx - start_idx)
-    return total_loss_val / num_batches, total_error_val / num_batches
+        
+        if is_best:
+            filepath = os.path.join(self.config['system'].model_save_dir, 'best_model.pth')
+        else:
+            filepath = os.path.join(self.config['system'].checkpoints_dir, f'checkpoint_epoch_{epoch+1}.pth')
+        
+        torch.save(checkpoint, filepath)
+        
+    def load_checkpoint(self, filepath):
+        """Cargar checkpoint del modelo"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        self.train_losses = checkpoint['train_losses']
+        self.val_losses = checkpoint['val_losses']
+        
+        return checkpoint['epoch'], checkpoint['val_loss']
+    
+    def save_training_metrics(self):
+        """Guardar métricas de entrenamiento"""
+        metrics = {
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'best_val_loss': self.best_val_loss,
+            'config': self.config
+        }
+        
+        filepath = os.path.join(self.config['system'].log_dir, 'training_metrics.json')
+        with open(filepath, 'w') as f:
+            # Convertir config a dict serializable
+            serializable_config = {}
+            for key, value in self.config.items():
+                if hasattr(value, '__dict__'):
+                    serializable_config[key] = value.__dict__
+                else:
+                    serializable_config[key] = value
+            
+            metrics['config'] = serializable_config
+            json.dump(metrics, f, indent=2)
+    
+    def visualize_training_progress(self, epoch):
+        """Visualizar progreso del entrenamiento"""
+        self.visualizer.plot_training_curves(
+            self.train_losses,
+            self.val_losses,
+            save_path=os.path.join(self.config['system'].log_dir, f'training_curves_epoch_{epoch+1}.png')
+        )
+    
+    def log_training_step(self, batch_idx, total_batches, loss):
+        """Log de paso de entrenamiento"""
+        if batch_idx % self.config['system'].log_interval == 0:
+            progress = 100.0 * batch_idx / total_batches
+            print(f'Batch {batch_idx}/{total_batches} ({progress:.1f}%) - Loss: {loss:.6f}')
 
-if __name__ == '__main__':
-    train_pose_estimation()
+def main():
+    """Función principal"""
+    parser = argparse.ArgumentParser(description='Entrenar PointNet para estimación de pose')
+    parser.add_argument('--ply_path', type=str, required=True,
+                        help='Ruta al archivo .ply del oil pan')
+    parser.add_argument('--epochs', type=int, default=200,
+                        help='Número de épocas de entrenamiento')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Tamaño del batch')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device (cuda/cpu)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Ruta a checkpoint para resumir entrenamiento')
+    
+    args = parser.parse_args()
+    
+    # Validar archivo PLY
+    if not validate_dataset(args.ply_path):
+        print("Error: No se puede cargar el archivo PLY especificado")
+        return
+    
+    # Configurar device
+    device = args.device if torch.cuda.is_available() else 'cpu'
+    print(f"Usando device: {device}")
+    
+    # Cargar configuración
+    config = get_config()
+    
+    # Actualizar configuración con argumentos
+    config['training'].num_epochs = args.epochs
+    config['training'].batch_size = args.batch_size
+    config['training'].learning_rate = args.lr
+    config['system'].device = device
+    
+    # Crear data loaders
+    print("Creando datasets...")
+    train_loader, val_loader, test_loader = create_data_loaders(args.ply_path, config)
+    
+    # Inicializar trainer
+    trainer = PoseTrainer(config, device)
+    
+    # Resumir entrenamiento si se especifica
+    start_epoch = 0
+    if args.resume:
+        print(f"Resumiendo entrenamiento desde: {args.resume}")
+        start_epoch, _ = trainer.load_checkpoint(args.resume)
+        start_epoch += 1
+    
+    # Entrenar
+    trainer.train(train_loader, val_loader, args.epochs - start_epoch)
+    
+    # Evaluación final
+    print("\nEvaluando modelo final...")
+    from evaluate_pose import evaluate_model_complete
+    evaluate_model_complete(trainer.model, test_loader, device, './results/final_evaluation')
+    
+    print("¡Entrenamiento completado!")
+
+if __name__ == "__main__":
+    main()
