@@ -7,6 +7,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 
+
+
 class PointCloudVisualizer:
     """Clase para visualizar nubes de puntos y resultados de pose"""
     
