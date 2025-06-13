@@ -1,0 +1,20 @@
+
+POSE ESTIMATION EVALUATION REPORT
+================================
+
+ACCURACY METRICS:
+- Rotation Accuracy: 0.6140
+- Translation Accuracy: 0.3070
+- Combined Accuracy: 0.2200
+
+ERROR STATISTICS:
+Rotation Errors:
+- Mean: 15.78°
+- Median: 12.84°
+- Std: 14.26°
+
+Translation Errors:
+- Mean: 0.1240
+- Median: 0.1212
+- Std: 0.0469
+
